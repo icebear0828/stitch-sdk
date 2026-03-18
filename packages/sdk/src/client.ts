@@ -173,14 +173,14 @@ export class StitchToolClient implements StitchToolClientSpec {
   }
 
   /**
-   * Tools that should NOT be retried on network errors because they trigger
-   * non-idempotent operations on the server.
+   * Tools that are safe to retry on network errors (idempotent read operations).
+   * Unknown tools default to NOT retrying — safer than the reverse.
    */
-  private static readonly NON_RETRYABLE_TOOLS = new Set([
-    "generate_screen_from_text",
-    "edit_screens",
-    "generate_variants",
-    "create_project",
+  private static readonly RETRYABLE_TOOLS = new Set([
+    "list_projects",
+    "get_project",
+    "list_screens",
+    "get_screen",
   ]);
 
   /**
@@ -194,8 +194,9 @@ export class StitchToolClient implements StitchToolClientSpec {
       msg.includes("fetch failed") ||
       msg.includes("econnrefused") ||
       msg.includes("econnreset") ||
-      msg.includes("socket") ||
-      msg.includes("network")
+      msg.includes("etimedout") ||
+      msg.includes("socket hang up") ||
+      msg.includes("other side closed")
     );
   }
 
@@ -217,7 +218,7 @@ export class StitchToolClient implements StitchToolClientSpec {
     } catch (error) {
       if (
         !this.isNetworkError(error) ||
-        StitchToolClient.NON_RETRYABLE_TOOLS.has(name)
+        !StitchToolClient.RETRYABLE_TOOLS.has(name)
       ) {
         throw error;
       }
@@ -226,12 +227,16 @@ export class StitchToolClient implements StitchToolClientSpec {
       this.isConnected = false;
       await this.connect();
 
-      const result = await this.client.callTool(
-        { name, arguments: args },
-        undefined,
-        { timeout: this.config.timeout },
-      );
-      return this.parseToolResponse<T>(result, name);
+      try {
+        const result = await this.client.callTool(
+          { name, arguments: args },
+          undefined,
+          { timeout: this.config.timeout },
+        );
+        return this.parseToolResponse<T>(result, name);
+      } catch {
+        throw error; // throw the original error, not the retry error
+      }
     }
   }
 
