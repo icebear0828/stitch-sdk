@@ -148,6 +148,11 @@ export class StitchToolClient implements StitchToolClientSpec {
   }
 
   private async doConnect() {
+    // Close existing transport before creating a new one to prevent resource leaks
+    if (this.transport) {
+      await this.transport.close().catch(() => {});
+    }
+
     // Create transport with auth headers injected per-instance (no global fetch mutation)
     this.transport = new StreamableHTTPClientTransport(
       new URL(this.config.baseUrl),
@@ -168,18 +173,71 @@ export class StitchToolClient implements StitchToolClientSpec {
   }
 
   /**
+   * Tools that are safe to retry on network errors (idempotent read operations).
+   * Unknown tools default to NOT retrying — safer than the reverse.
+   */
+  private static readonly RETRYABLE_TOOLS = new Set([
+    "list_projects",
+    "get_project",
+    "list_screens",
+    "get_screen",
+  ]);
+
+  /**
+   * Check if an error is a transient network failure (not an application error).
+   */
+  private isNetworkError(error: unknown): boolean {
+    if (error instanceof StitchError) return false;
+    const msg =
+      error instanceof Error ? error.message.toLowerCase() : String(error);
+    return (
+      msg.includes("fetch failed") ||
+      msg.includes("econnrefused") ||
+      msg.includes("econnreset") ||
+      msg.includes("etimedout") ||
+      msg.includes("socket hang up") ||
+      msg.includes("other side closed")
+    );
+  }
+
+  /**
    * Generic tool caller with type support and error parsing.
+   * Retries once on transient network errors for idempotent (read) operations.
+   * Non-idempotent tools (generate, edit, create) are not retried.
    */
   async callTool<T>(name: string, args: Record<string, any>): Promise<T> {
     if (!this.isConnected) await this.connect();
 
-    const result = await this.client.callTool(
-      { name, arguments: args },
-      undefined,
-      { timeout: this.config.timeout },
-    );
+    try {
+      const result = await this.client.callTool(
+        { name, arguments: args },
+        undefined,
+        { timeout: this.config.timeout },
+      );
+      return this.parseToolResponse<T>(result, name);
+    } catch (error) {
+      if (
+        !this.isNetworkError(error) ||
+        !StitchToolClient.RETRYABLE_TOOLS.has(name)
+      ) {
+        throw error;
+      }
 
-    return this.parseToolResponse<T>(result, name);
+      // Reconnect and retry once for idempotent operations
+      this.isConnected = false;
+      await this.connect();
+
+      try {
+        const result = await this.client.callTool(
+          { name, arguments: args },
+          undefined,
+          { timeout: this.config.timeout },
+        );
+        return this.parseToolResponse<T>(result, name);
+      } catch {
+        throw error; // throw the original error, not the retry error
+      }
+    }
   }
 
   async listTools() {
